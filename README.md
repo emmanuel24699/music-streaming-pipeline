@@ -16,26 +16,7 @@ This project implements a real-time ETL pipeline on AWS to process music streami
 
 ## Architecture
 
-```
-[S3 Upload: streams.csv]
-       |
-[Lambda Trigger]
-       |
-[Airflow DAG: music_streaming_pipeline]
-       |
-[1. Validate Files (Glue: validate_input_files)]
-       |
-[2. Check Valid Files (Python: check_valid_files)]
-       |
-[3. Transform & Compute KPIs (Glue: transform_compute_kpis)]
-       |
-[4. Load KPIs to DynamoDB (Glue: load_kpis_to_dynamodb)]
-       |
-[5. Archive Streams File (Glue: archive_streams_files)]
-       |
-[DynamoDB: FileValidationMetadata, KPIs]
-[S3: data/kpis/, data/archive/]
-```
+<img src='images/architecture diagram.png' width='980' height='550'>
 
 ### Components
 

@@ -109,8 +109,9 @@ def main():
         output_date = datetime.utcnow().strftime("%Y/%m/%d")
 
         # --- KPI Computation ---
+
         # 1. Daily Genre-Level KPIs
-        genre_stats = (
+        genre_stats_agg = (
             joined_df.groupBy("listen_date", "track_genre")
             .agg(
                 count("*").alias("listen_count"),
@@ -121,25 +122,17 @@ def main():
                 "avg_listening_time_per_user_ms",
                 col("total_listening_time_ms") / col("unique_listeners"),
             )
-            .select(
-                col("listen_date").cast("string"),
-                concat(lit("GENRE_"), col("track_genre")).alias("kpi_type"),
-                to_json(
-                    create_map(
-                        lit("track_genre"),
-                        col("track_genre"),
-                        lit("listen_count"),
-                        col("listen_count"),
-                        lit("unique_listeners"),
-                        col("unique_listeners"),
-                        lit("total_listening_time_ms"),
-                        col("total_listening_time_ms"),
-                        lit("avg_listening_time_per_user_ms"),
-                        col("avg_listening_time_per_user_ms"),
-                    )
-                ).alias("kpi_data"),
-                lit(datetime.utcnow().isoformat()).alias("ingestion_timestamp"),
-            )
+        )
+
+        genre_stats_flat = genre_stats_agg.select(
+            col("listen_date").cast("string"),
+            concat(lit("GENRE_"), col("track_genre")).alias("kpi_type"),
+            col("track_genre"),
+            col("listen_count"),
+            col("unique_listeners"),
+            col("total_listening_time_ms"),
+            col("avg_listening_time_per_user_ms"),
+            lit(datetime.utcnow().isoformat()).alias("ingestion_timestamp"),
         )
 
         # 2. Top 3 Songs per Genre
@@ -193,7 +186,7 @@ def main():
 
         # --- Save KPIs to S3 ---
         kpi_base_path = f"s3://{bucket}/data/kpis/{output_date}/"
-        genre_stats.write.mode("overwrite").partitionBy("listen_date").parquet(
+        genre_stats_flat.write.mode("overwrite").partitionBy("listen_date").parquet(
             f"{kpi_base_path}genre_stats/"
         )
         top_songs.write.mode("overwrite").partitionBy("listen_date").parquet(

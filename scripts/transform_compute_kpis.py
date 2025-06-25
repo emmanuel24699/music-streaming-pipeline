@@ -6,12 +6,11 @@ from pyspark.sql.functions import (
     countDistinct,
     sum,
     lit,
-    create_map,
+    trim,
+    concat,
     struct,
     collect_list,
     to_json,
-    trim,
-    concat,
     rank,
 )
 from pyspark.sql.window import Window
@@ -27,6 +26,8 @@ args = getResolvedOptions(sys.argv, ["JOB_NAME", "s3_key", "bucket"])
 spark = SparkSession.builder.appName(
     f"{args['JOB_NAME']}-Transformation-Multi-Table"
 ).getOrCreate()
+
+
 glueContext = GlueContext(spark.sparkContext)
 job = Job(glueContext)
 job.init(args["JOB_NAME"], args)
@@ -51,25 +52,57 @@ def get_valid_files(prefix):
 
 def main():
     try:
-        # Get valid file keys and read data
-        streams_keys = (
-            [s3_key]
-            if table.get_item(Key={"file_key": s3_key})
-            .get("Item", {})
-            .get("validation_status")
-            == "SUCCESS"
-            else []
-        )
-        songs_keys = get_valid_files("data/raw/songs/")
-        users_keys = get_valid_files("data/raw/users/")
-        if not (streams_keys and songs_keys and users_keys):
-            print("No valid files for all required types, exiting")
-            return
-        streams_df = spark.read.csv(
-            [f"s3://{bucket}/{key}" for key in streams_keys],
+        # --- 1. Read the new validated streams file ---
+        new_streams_df = spark.read.csv(
+            f"s3://{bucket}/{s3_key}",
             header=True,
             inferSchema=True,
+        ).withColumn("listen_time", to_date(col("listen_time")))
+
+        new_streams_df = new_streams_df.dropna(
+            subset=["user_id", "track_id", "listen_time"]
+        ).dropDuplicates(["user_id", "track_id", "listen_time"])
+
+        # --- 2. Upsert/Merge into the Hudi fact table ---
+        fact_path = f"s3://{bucket}/data/fact/streams/"
+        hudi_options = {
+            "hoodie.table.name": "streams_fact",
+            "hoodie.datasource.write.recordkey.field": "user_id,track_id,listen_time",
+            "hoodie.datasource.write.partitionpath.field": "listen_time",
+            "hoodie.datasource.write.table.name": "streams_fact",
+            "hoodie.datasource.write.operation": "upsert",
+            "hoodie.datasource.write.precombine.field": "listen_time",
+            "hoodie.upsert.shuffle.parallelism": 2,
+            "hoodie.insert.shuffle.parallelism": 2,
+            "hoodie.datasource.write.hive_style_partitioning": "true",
+        }
+
+        new_streams_df.write.format("hudi").options(**hudi_options).mode("append").save(
+            fact_path
         )
+
+        # --- 3. Read all streams for the relevant date(s) from the Hudi fact table ---
+        listen_dates = [
+            row["listen_time"]
+            for row in new_streams_df.select("listen_time").distinct().collect()
+        ]
+        if not listen_dates:
+            print("No valid listen_time found in new streams file.")
+            job.commit()
+            exit(0)
+
+        # Hudi supports partition pruning, so we can read only the relevant partitions
+        fact_paths = [f"{fact_path}/listen_time={d}" for d in listen_dates]
+        streams_df = spark.read.format("hudi").load(*fact_paths)
+        streams_df = streams_df.dropDuplicates(["user_id", "track_id", "listen_time"])
+
+        # --- 4. Read and clean songs and users as before ---
+        songs_keys = get_valid_files("data/raw/songs/")
+        users_keys = get_valid_files("data/raw/users/")
+        if not (songs_keys and users_keys):
+            print("No valid files for all required types, exiting")
+            job.commit()
+            exit(0)
         songs_df = spark.read.csv(
             [f"s3://{bucket}/{key}" for key in songs_keys],
             header=True,
@@ -81,12 +114,6 @@ def main():
             inferSchema=True,
         )
 
-        # Data Cleaning
-        streams_df = (
-            streams_df.withColumn("listen_time", to_date(col("listen_time")))
-            .dropna(subset=["user_id", "track_id", "listen_time"])
-            .dropDuplicates(["user_id", "track_id", "listen_time"])
-        )
         songs_df = (
             songs_df.withColumn("duration_ms", col("duration_ms").cast("integer"))
             .dropna(subset=["duration_ms"])
@@ -100,15 +127,13 @@ def main():
         )
         users_df = users_df.dropna(subset=["user_id"]).dropDuplicates(["user_id"])
 
-        # Join datasets
+        # --- 5. Join and compute KPIs as before ---
         joined_df = (
             streams_df.join(songs_df, "track_id", "inner")
             .join(users_df, "user_id", "inner")
             .withColumn("listen_date", to_date(col("listen_time")))
         )
         output_date = datetime.utcnow().strftime("%Y/%m/%d")
-
-        # --- KPI Computation ---
 
         # 1. Daily Genre-Level KPIs
         genre_stats_agg = (
@@ -123,7 +148,6 @@ def main():
                 col("total_listening_time_ms") / col("unique_listeners"),
             )
         )
-
         genre_stats_flat = genre_stats_agg.select(
             col("listen_date").cast("string"),
             concat(lit("GENRE_"), col("track_genre")).alias("kpi_type"),
@@ -134,7 +158,6 @@ def main():
             col("avg_listening_time_per_user_ms"),
             lit(datetime.utcnow().isoformat()).alias("ingestion_timestamp"),
         )
-
         # 2. Top 3 Songs per Genre
         song_counts = joined_df.groupBy("listen_date", "track_genre", "track_name").agg(
             count("*").alias("song_listen_count")
@@ -159,7 +182,6 @@ def main():
                 lit(datetime.utcnow().isoformat()).alias("ingestion_timestamp"),
             )
         )
-
         # 3. Top 5 Genres per Day
         genre_counts = joined_df.groupBy("listen_date", "track_genre").agg(
             count("*").alias("genre_listen_count")
@@ -183,7 +205,6 @@ def main():
                 lit(datetime.utcnow().isoformat()).alias("ingestion_timestamp"),
             )
         )
-
         # --- Save KPIs to S3 ---
         kpi_base_path = f"s3://{bucket}/data/kpis/{output_date}/"
         genre_stats_flat.write.mode("overwrite").partitionBy("listen_date").parquet(
@@ -196,7 +217,6 @@ def main():
             f"{kpi_base_path}top_genres/"
         )
         print(f"Saved all KPIs to base path: {kpi_base_path}")
-
     except Exception as e:
         print(f"Error in transformation/KPI computation: {str(e)}")
         raise e

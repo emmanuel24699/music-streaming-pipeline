@@ -8,31 +8,31 @@ This project implements a real-time ETL pipeline on AWS to process music streami
 
 - **Ingestion**: Lambda triggers the pipeline for new `streams` files in `s3://lab3-music-streaming-amalitechde1/data/raw/streams/`.
 - **Validation**: Ensures required columns in input files, moving invalid files to `data/error/`.
-- **Transformation**: Computes KPIs (daily genre stats, top 3 songs per genre, top 5 genres per day).
+- **Transformation**: Computes KPIs (daily genre stats, top 3 songs per genre, top 5 genres per day)
 - **Storage**: Ingests KPIs into DynamoDB.
-- **Archival**: Moves processed `streams` files to `data/archive/YYYY/MM/DD/` with timestamp prefixes.
+- **Archival**: Moves processed `streams` files to `archives` folder with timestamp prefixes.
 - **Orchestration**: Airflow DAG ensures sequential execution with retries and short-circuiting for invalid files.
 - **Metadata**: Tracks file status in `FileValidationMetadata` DynamoDB table.
 
 ## Architecture
 
-<img src='images/architecture diagram.png' width='980' height='550'>
+<img src='images/architecture_diagram.png' width='980' height='550'>
 
 ### Components
 
 - **AWS Lambda**: `lambda_function.py` triggers the Airflow DAG for new `streams` files.
 - **AWS Glue**: Python Shell and Spark jobs for validation, transformation, ingestion, and archival.
 - **Amazon MWAA (Airflow)**: Orchestrates tasks with `music_streaming_pipeline.py`.
-- **Amazon S3**: Stores input files (`data/raw/`), KPIs (`data/kpis/`), archived files (`data/archive/`), and scripts (`scripts/`, `dags/`).
+- **Amazon S3**: Stores input files (`data/raw/`), Hudi fact table (`data/fact/streams/`), KPIs (`data/kpis/`), archived files (`data/archive/`), and scripts (`scripts/`, `dags/`).
 - **Amazon DynamoDB**: Stores metadata (`FileValidationMetadata`) and KPIs.
 - **Amazon CloudWatch**: Logs job execution and errors.
 
 ## Prerequisites
 
-- **AWS Account**: Active account.
-- **IAM Role**: `GlueTransformKPIsRole` with permissions for S3, DynamoDB, Glue, and MWAA.
+- **IAM Role**: Glue Role with permissions for S3, DynamoDB, Glue, and MWAA.
 - **S3 Bucket**: `lab3-music-streaming-amalitechde1` with folders:
   - `data/raw/streams/`, `data/raw/songs/`, `data/raw/users/`
+  - `data/fact/streams/`
   - `data/kpis/`, `data/archive/`, `data/error/`
   - `scripts/`, `dags/`
 - **DynamoDB Tables**:
@@ -41,6 +41,7 @@ This project implements a real-time ETL pipeline on AWS to process music streami
   - `TopSongsByGenre` (partition key: `listen_date`, sort key: `track_genre`).
   - `TopGenresByDay` (partition key: `listen_date`).
 - **MWAA Environment**: `Lab3-MWAA` with Airflow 2.x, Python 3.9+, and AWS plugins.
+- **Hudi Dependencies**: Required for `transform_compute_kpis` Glue job (Spark).
 
 ### IAM Policy for `GlueTransformKPIsRole`
 
@@ -64,7 +65,7 @@ This project implements a real-time ETL pipeline on AWS to process music streami
         "dynamodb:GetItem",
         "dynamodb:PutItem",
         "dynamodb:UpdateItem",
-        "dynamodb:Scan"
+        "dynamodb:Scan",
         "dynamodb:Query"
       ],
       "Resource": [
@@ -81,7 +82,11 @@ This project implements a real-time ETL pipeline on AWS to process music streami
     },
     {
       "Effect": "Allow",
-      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
       "Resource": "*"
     }
   ]
@@ -95,6 +100,7 @@ This project implements a real-time ETL pipeline on AWS to process music streami
 1. Go to **S3** > **Create bucket** > Name: `lab3-music-streaming-amalitechde1`, Region: `us-east-1`.
 2. Create folders:
    - `data/raw/streams/`, `data/raw/songs/`, `data/raw/users/`
+   - `data/fact/streams/` (for Hudi fact table)
    - `data/kpis/`, `data/archive/`, `data/error/`
    - `scripts/`, `dags/`
 
@@ -129,30 +135,30 @@ This project implements a real-time ETL pipeline on AWS to process music streami
 1. Upload scripts to **S3** > `lab3-music-streaming-amalitechde1` > `scripts/`:
    - `validate_input_files.py`
    - `transform_compute_kpis.py`
-   - `load_kpis_to_dynamodb.py`
+   - `load_kpis_to_dynamodb1.py`
    - `archive_streams_files.py`
 2. Go to **AWS Glue** > **Jobs** > **Add job** for each:
-   - **validate_input_files**: Python Shell, Script: `validate_input_files.py`, Role: `GlueTransformKPIsRole`.
-   - **transform_compute_kpis**: Spark, Script: `transform_compute_kpis.py`, Role: `GlueTransformKPIsRole`, `--bucket lab3-music-streaming-amalitechde1`.
-   - **load_kpis_to_dynamodb**: Spark, Script: `load_kpis_to_dynamodb.py`, Role: `GlueTransformKPIsRole`.
-   - **archive_streams_files**: Python Shell, Script: `archive_streams_files.py`, Role: `GlueTransformKPIsRole`, `--bucket lab3-music-streaming-amalitechde1`.
+   - **validate_input_files**: Python Shell, Script: `validate_input_files.py`, Role: `GlueTransformKPIsRole`
+   - **transform_compute_kpis**: Spark, Script: `transform_compute_kpis.py`, Role: `GlueTransformKPIsRole`
+   - **load_kpis_to_dynamodb1**: `load_kpis_to_dynamodb1.py`, Role: `GlueTransformKPIsRole`,
+   - **archive_streams_files**: Python Shell, Script: `archive_streams_files.py`, Role: `GlueTransformKPIsRole`
 
 ### 6. Deploy Airflow DAG
 
-1. Upload `music_streaming_pipeline.py` to **S3** > `lab3-music-streaming-amalitechde1` > `dags/`.
+1. Upload `music_streaming_pipeline.py` to **S3 Bucket** > `dags/`.
 2. Go to **Airflow** > `Lab3-MWAA` > **Web UI** > **DAGs** > Verify `music_streaming_pipeline` is active.
 
 ## Usage
 
 1. **Trigger Pipeline**:
-   - Upload a `streams` CSV file to `s3://lab3-music-streaming-amalitechde1/data/raw/streams/` (e.g., `streams1.csv`).
+   - Upload a `streams` CSV file to `data/raw/streams/` (e.g., `streams1.csv`).
    - Ensure valid `songs` and `users` CSV files exist in `data/raw/songs/` and `data/raw/users/`.
 2. **Monitor Execution**:
    - **Airflow**: Go to **Airflow Web UI** > `music_streaming_pipeline` > **Graph** or **Tree** view.
    - **Glue**: Check job runs in **AWS Glue** > **Jobs**.
    - **CloudWatch**: View logs in `/aws/glue/<job_name>` and `/aws/lambda/trigger_music_pipeline_dag`.
 3. **Verify Output**:
-   - **S3**: KPIs in `data/kpis/YYYY/MM/DD/`, archived files in `data/archive/YYYY/MM/DD/`.
+   - **S3**: Hudi fact table in `data/fact/streams/`, KPIs in `data/kpis/YYYY/MM/DD/` (Parquet, partitioned by `listen_date`), archived files in `data/archive/YYYY/MM/DD/`.
    - **DynamoDB**: Query `FileValidationMetadata` for `validation_status`, `kpi_ingestion_status`, `archival_status`. Check KPI tables for data.
 
 ## Testing
@@ -161,8 +167,8 @@ This project implements a real-time ETL pipeline on AWS to process music streami
    - Valid `streams1.csv`:
      ```csv
      user_id,track_id,listen_time
-     u1,t1,2025-06-22 10:00:00
-     u2,t2,2025-06-22 10:01:00
+     u1,t1,2025-06-25 10:00:00
+     u2,t2,2025-06-25 10:01:00
      ```
    - Valid `songs1.csv`:
      ```csv
@@ -179,32 +185,27 @@ This project implements a real-time ETL pipeline on AWS to process music streami
    - Invalid `streams2.csv` (missing `track_id`):
      ```csv
      user_id,listen_time
-     u1,2025-06-22 10:00:00
+     u1,2025-06-25 10:00:00
      ```
 2. **Run Pipeline**:
    - Upload files to respective S3 folders.
    - Monitor DAG in Airflow.
 3. **Expected Results**:
-   - Valid files: KPIs in `data/kpis/`, DynamoDB tables populated, `streams1.csv` archived to `data/archive/YYYY/MM/DD/<timestamp>_streams1.csv`, `FileValidationMetadata` updated (`SUCCESS`).
+   - Valid files: Hudi fact table updated in `data/fact/streams/`, KPIs in `data/kpis/YYYY/MM/DD/` (Parquet, partitioned by `listen_date`), DynamoDB tables populated, `streams1.csv` archived, `FileValidationMetadata` updated (`SUCCESS`).
    - Invalid files: Moved to `data/error/`, `FileValidationMetadata` updated (`FAILED`).
 
 ## Maintenance
 
 - **Monitoring**:
-  - **Airflow**: Check DAG runs for failures or retries (15 retries, 1-minute delay).
+  - **Airflow**: Check DAG runs for failures or retries.
   - **CloudWatch**: Monitor logs for errors in Glue jobs and Lambda.
   - **DynamoDB**: Query `FileValidationMetadata` for `FAILED` statuses.
 - **Troubleshooting**:
-  - **Glue Job Fails**: Check CloudWatch logs, verify IAM permissions, ensure S3 paths exist.
+  - **Glue Job Fails**: Check CloudWatch logs, verify IAM permissions, ensure S3 paths and Hudi dependencies are correct.
   - **DAG Fails**: Inspect Airflow logs.
   - **Lambda Fails**: Verify MWAA VPC access, check CloudWatch logs.
-- **Scaling**:
-  - Increase DynamoDB capacity for high write throughput.
-  - Adjust Glue job concurrency if processing multiple files.
 
 ## Future Improvements
 
 - Implement SNS notifications for job failures or archival errors.
 - Enhance logging with custom CloudWatch metrics (e.g., file processing time).
-
-##

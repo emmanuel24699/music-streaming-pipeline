@@ -16,6 +16,7 @@ default_args = {
     "max_retry_delay": timedelta(minutes=80),
 }
 
+
 def check_valid_files(**context):
     """Check if valid files exist in FileValidationMetadata."""
     dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
@@ -65,6 +66,7 @@ def check_valid_files(**context):
     )
     return result
 
+
 def shortcircuit_handler(**context):
     """
     Perform cleanup for invalid or missing files. This could include deleting or archiving invalid files from S3.
@@ -81,12 +83,17 @@ def shortcircuit_handler(**context):
     # Example: Move the invalid file to an 'invalid/' prefix in the same bucket
     invalid_key = f"invalid/{s3_key.split('/')[-1]}"
     try:
-        logger.info(f"Archiving invalid file {s3_key} to {invalid_key} in bucket {bucket}")
-        s3.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": s3_key}, Key=invalid_key)
+        logger.info(
+            f"Archiving invalid file {s3_key} to {invalid_key} in bucket {bucket}"
+        )
+        s3.copy_object(
+            Bucket=bucket, CopySource={"Bucket": bucket, "Key": s3_key}, Key=invalid_key
+        )
         s3.delete_object(Bucket=bucket, Key=s3_key)
         logger.info(f"File {s3_key} archived and deleted from original location.")
     except ClientError as e:
         logger.error(f"Failed to archive/delete invalid file {s3_key}: {e}")
+
 
 with DAG(
     dag_id="music_streaming_pipeline",

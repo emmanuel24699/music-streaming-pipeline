@@ -1,9 +1,10 @@
 from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
-from airflow.operators.python import ShortCircuitOperator
+from airflow.operators.python import ShortCircuitOperator, PythonOperator
 import boto3
 from botocore.exceptions import ClientError
+import logging
 
 # DAG default arguments with exponential backoff
 default_args = {
@@ -14,7 +15,6 @@ default_args = {
     "retry_exponential_backoff": True,
     "max_retry_delay": timedelta(minutes=80),
 }
-
 
 def check_valid_files(**context):
     """Check if valid files exist in FileValidationMetadata."""
@@ -65,8 +65,29 @@ def check_valid_files(**context):
     )
     return result
 
+def shortcircuit_handler(**context):
+    """
+    Perform cleanup for invalid or missing files. This could include deleting or archiving invalid files from S3.
+    """
+    s3_key = context["dag_run"].conf.get("s3_key", "")
+    bucket = "lab3-music-streaming-amalitechde1"
+    s3 = boto3.client("s3", region_name="us-east-1")
+    logger = logging.getLogger("airflow.task")
 
-# Define DAG
+    if not s3_key:
+        logger.info("No s3_key provided, nothing to clean up.")
+        return
+
+    # Example: Move the invalid file to an 'invalid/' prefix in the same bucket
+    invalid_key = f"invalid/{s3_key.split('/')[-1]}"
+    try:
+        logger.info(f"Archiving invalid file {s3_key} to {invalid_key} in bucket {bucket}")
+        s3.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": s3_key}, Key=invalid_key)
+        s3.delete_object(Bucket=bucket, Key=s3_key)
+        logger.info(f"File {s3_key} archived and deleted from original location.")
+    except ClientError as e:
+        logger.error(f"Failed to archive/delete invalid file {s3_key}: {e}")
+
 with DAG(
     dag_id="music_streaming_pipeline",
     default_args=default_args,
@@ -86,7 +107,7 @@ with DAG(
     )
 
     # Task 2: Check for valid files
-    check_valid_files = ShortCircuitOperator(
+    check_valid_files_task = ShortCircuitOperator(
         task_id="check_valid_files",
         python_callable=check_valid_files,
         provide_context=True,
@@ -121,7 +142,7 @@ with DAG(
     # Task 5: Archive the processed streams file
     archive_file = GlueJobOperator(
         task_id="archive_processed_file",
-        job_name="archive_streams_files",  # This tells Airflow which job to RUN
+        job_name="archive_streams_files",
         aws_conn_id="aws_default",
         region_name="us-east-1",
         script_args={
@@ -132,11 +153,14 @@ with DAG(
         retries=15,
     )
 
-    # Set task dependencies
-    (
-        validate_files
-        >> check_valid_files
-        >> transform_data
-        >> load_to_dynamodb
-        >> archive_file
+    # Shortcircuit/fail branch handler
+    shortcircuit_handler_task = PythonOperator(
+        task_id="shortcircuit_handler",
+        python_callable=shortcircuit_handler,
+        provide_context=True,
     )
+
+    # Dependencies
+    validate_files >> check_valid_files_task
+    check_valid_files_task >> transform_data >> load_to_dynamodb >> archive_file
+    check_valid_files_task >> shortcircuit_handler_task
